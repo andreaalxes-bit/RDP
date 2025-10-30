@@ -8,60 +8,91 @@ on:
 jobs:
   rdp-access:
     runs-on: windows-latest
-    timeout-minutes: 3600
+    timeout-minutes: 4320 # 3 أيام كحد أقصى لكل تشغيل GitHub Actions
 
     steps:
       - name: Enable RDP and Prevent Sleep
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 1
-          netsh advfirewall firewall delete rule name="RDP-Tailscale" > $null
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 1 -Force
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" > $null 2>&1
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
           powercfg /change standby-timeout-ac 0
           powercfg /change hibernate-timeout-ac 0
-          Restart-Service TermService
+          powercfg /change monitor-timeout-ac 0
+          Restart-Service -Name TermService -Force
 
-      - name: Create RDP User
+      - name: Create or Update RDP User
         run: |
+          # توليد كلمة مرور قوية بطول 16 حرفاً
           $password = -join ((33..126) | Get-Random -Count 16 | ForEach-Object {[char]$_})
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          if (-not (Get-LocalUser -Name "RDP")) {
-            New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-            Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -PasswordNeverExpires
             Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+            Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           } else {
             Set-LocalUser -Name "RDP" -Password $securePass
           }
+
+          # إخراج كلمة المرور كمتغير بيئي آمن للاستخدام لاحقاً داخل الـ job
           echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
 
       - name: Install Tailscale
         run: |
           $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $path = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri $url -OutFile $path
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$path`"", "/quiet", "/norestart" -Wait
-          Remove-Item $path
+          $path = Join-Path $env:TEMP "tailscale.msi"
+          Invoke-WebRequest -Uri $url -OutFile $path -UseBasicParsing
+          Start-Process -FilePath "msiexec.exe" -ArgumentList "/i", "`"$path`"", "/quiet", "/norestart" -Wait
+          Remove-Item -Path $path -Force
 
       - name: Connect to Tailscale
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-${{ github.run_id }}
+          $exe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+          if (-not (Test-Path $exe)) {
+            Write-Error "Tailscale executable not found at $exe"
+            exit 1
+          }
+          & $exe up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-${{ github.run_id }} --accept-routes=false
           $tsIP = $null
-          for ($i=0; $i -lt 10; $i++) {
-            $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-            if ($tsIP) { break }
+          for ($i = 0; $i -lt 20; $i++) {
+            $tsIP = & $exe ip -4 2>$null
+            if ($tsIP -and $tsIP.Trim()) { break }
             Start-Sleep -Seconds 5
           }
-          if (-not $tsIP) { Write-Error "No Tailscale IP"; exit 1 }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          if (-not $tsIP) {
+            Write-Error "No Tailscale IPv4 address assigned"
+            exit 1
+          }
+          # قد يرجع أكثر من IP، نأخذ أول سطر صالح
+          $firstIp = ($tsIP -split "`n" | Select-Object -First 1).Trim()
+          echo "TAILSCALE_IP=$firstIp" >> $env:GITHUB_ENV
+
+      - name: Verify RDP Port Reachability
+        run: |
+          $ip = $env:TAILSCALE_IP
+          if (-not $ip) {
+            Write-Error "TAILSCALE_IP not set"
+            exit 1
+          }
+          $res = Test-NetConnection -ComputerName $ip -Port 3389 -WarningAction SilentlyContinue
+          if (-not $res.TcpTestSucceeded) {
+            Write-Warning "TCP test to $ip:3389 failed; continuing but RDP may not be reachable yet."
+          }
 
       - name: Send RDP Info to Gmail
+        env:
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
         run: |
           $smtpServer = "smtp.gmail.com"
           $smtpPort = 587
           $from = "ansbsh141@gmail.com"
           $to = "ansbsh141@gmail.com"
-          $subject = "🔐 RDP Access Info - GitHub Runner"
+          $subject = "RDP Access Info - GitHub Runner $($env:GITHUB_RUN_ID)"
           $body = @"
 RDP Access Details:
 
@@ -69,17 +100,18 @@ IP Address: $env:TAILSCALE_IP
 Username: RDP
 Password: $env:RDP_PASSWORD
 
-This info is valid for 24 hours. Workflow auto-renews daily.
+Note: This Runner is ephemeral; workflow auto-renews daily (or when triggered). Each run is valid up to 72 hours per GitHub Actions limits.
 "@
-          $securePassword = ConvertTo-SecureString "${{ secrets.GMAIL_APP_PASSWORD }}" -AsPlainText -Force
-          $cred = New-Object System.Management.Automation.PSCredential($from, $securePassword)
+          # تحضير بيانات الاعتماد وإرسال الرسالة
+          $securePass = ConvertTo-SecureString $env:GMAIL_APP_PASSWORD -AsPlainText -Force
+          $cred = New-Object System.Management.Automation.PSCredential($from, $securePass)
           Send-MailMessage -To $to -From $from -Subject $subject -Body $body -SmtpServer $smtpServer -Port $smtpPort -UseSsl -Credential $cred
 
-      - name: Keep Alive
+      - name: Keep Runner Alive
         run: |
-          while ($true) {
-            Write-Host "[$(Get-Date)] RDP Active"
-            Start-Sleep -Seconds 300
-          }te)] RDP Active"
+          # ملاحظة: كل تشغيل GitHub Actions محدود حتى 72 ساعة؛ هذه الحلقة تبقي المهمة نشطة لمدة التشغيل
+          $end = (Get-Date).AddHours(72)
+          while ((Get-Date) -lt $end) {
+            Write-Host "[$(Get-Date)] RDP Active - Runner will remain active until job timeout or manual cancel"
             Start-Sleep -Seconds 300
           }
