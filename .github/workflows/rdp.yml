@@ -80,4 +80,6 @@ This info is valid for 24 hours. Workflow auto-renews daily.
           while ($true) {
             Write-Host "[$(Get-Date)] RDP Active"
             Start-Sleep -Seconds 300
+          }te)] RDP Active"
+            Start-Sleep -Seconds 300
           }
